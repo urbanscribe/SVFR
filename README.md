@@ -1,3 +1,18 @@
+
+python3 infer.py \
+ --config config/infer.yaml \
+ --task_ids 0 \
+ --input_path ./assert/lq/wat4.mov \
+ --output_dir ./results/ 
+
+
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+
+(venv) D:\SVFR>set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+(venv) D:\SVFR>python infer.py --config config/infer.yaml --task_ids 0 --input_path ./assert/lq/lq1.mp4 --output_dir ./results/
+
 <!-- # SVFR: A Unified Framework for Generalized Video Face Restoration -->
 
 <div>
