@@ -77,3 +77,4 @@ models/*
 *.tiff
 *.ico
 *.webp
+._.DS_Store
