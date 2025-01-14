@@ -14,40 +14,29 @@ from infer import main as process_video
 
 class VideoProcessingQueue:
     def __init__(self):
-        self.queue = list()  # List for reorderable queue
+        self.queue = py_queue.Queue()
         self.current_task = None
         self.processing = False
-        self.completed = []
-        self.failed = []
+        self.results = []
         self.lock = threading.Lock()
         
     def add_task(self, input_path, config, task_ids=None, seed=None, mask_path=None):
         """Add a video processing task to the queue"""
         task = {
-            'id': len(self.queue) + len(self.completed) + len(self.failed),
             'input_path': input_path,
             'config': config,
             'task_ids': task_ids or [0],
             'seed': seed or 77,
             'mask_path': mask_path,
             'status': 'queued',
-            'current_step': None,
             'added_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             'start_time': None,
             'end_time': None,
             'error': None
         }
-        with self.lock:
-            self.queue.append(task)
-        return task['id']
-
-    def reorder_queue(self, order):
-        """Reorder the queue based on new order of task IDs"""
-        with self.lock:
-            # Create a map of task ID to task
-            task_map = {task['id']: task for task in self.queue}
-            # Reorder queue based on new order
-            self.queue = [task_map[task_id] for task_id in order if task_id in task_map]
+        self.queue.put(task)
+        self.results.append(task)
+        return len(self.results) - 1  # Return task ID
 
     def start_processing(self):
         """Start processing the queue in a separate thread"""
@@ -61,50 +50,43 @@ class VideoProcessingQueue:
         """Process videos in the queue"""
         while self.processing:
             try:
-                with self.lock:
-                    if not self.queue:
-                        time.sleep(1)
-                        continue
-                    task = self.queue[0]  # Get first task
-                    self.current_task = task
-                    task['status'] = 'processing'
-                    task['start_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    task['current_step'] = 'Starting processing...'
-
-                try:
-                    # Create args object with task parameters
-                    class Args:
-                        pass
-                    args = Args()
-                    args.input_path = task['input_path']
-                    args.output_dir = "output"
-                    args.seed = task['seed']
-                    args.task_ids = task['task_ids']
-                    args.mask_path = task['mask_path']
-                    args.restore_frames = False
-
-                    # Process the video
-                    task['current_step'] = 'Processing video...'
-                    process_video(task['config'], args)
-                    
+                if not self.queue.empty():
                     with self.lock:
-                        task['status'] = 'completed'
-                        task['end_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        task['current_step'] = 'Complete'
-                        self.completed.append(task)
-                        self.queue.pop(0)
+                        task = self.queue.get()
+                        self.current_task = task
+                        task['status'] = 'processing'
+                        task['start_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                    try:
+                        # Create args object with task parameters
+                        class Args:
+                            pass
+                        args = Args()
+                        args.input_path = task['input_path']
+                        args.output_dir = "output"
+                        args.seed = task['seed']
+                        args.task_ids = task['task_ids']
+                        args.mask_path = task['mask_path']
+                        args.restore_frames = False
+
+                        # Process the video
+                        process_video(task['config'], args)
                         
-                except Exception as e:
-                    with self.lock:
-                        task['status'] = 'failed'
-                        task['error'] = str(e)
-                        task['end_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        task['current_step'] = 'Failed'
-                        self.failed.append(task)
-                        self.queue.pop(0)
-                        
-                finally:
-                    self.current_task = None
+                        with self.lock:
+                            task['status'] = 'completed'
+                            task['end_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            
+                    except Exception as e:
+                        with self.lock:
+                            task['status'] = 'failed'
+                            task['error'] = str(e)
+                            task['end_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            
+                    finally:
+                        self.queue.task_done()
+                        self.current_task = None
+                else:
+                    time.sleep(1)  # Prevent busy waiting
             except Exception as e:
                 print(f"Queue processing error: {str(e)}")
                 time.sleep(1)
@@ -113,26 +95,26 @@ class VideoProcessingQueue:
         """Stop processing the queue"""
         self.processing = False
 
-    def get_queue_status(self):
+    def get_status(self):
         """Get current queue status"""
         with self.lock:
             return {
-                'current': self.current_task,
-                'queued': self.queue,
-                'completed': self.completed,
-                'failed': self.failed
+                'queue_size': self.queue.qsize(),
+                'current_task': self.current_task,
+                'results': self.results
             }
 
 def create_ui():
     """Create Gradio interface for the queue system"""
-    config = OmegaConf.load("./configs/infer.yaml")
+    # Load default config
+    config = OmegaConf.load("./config/infer.yaml")
     
     queue_processor = VideoProcessingQueue()
     queue_processor.start_processing()
 
     def add_to_queue(video_path, task_ids, seed, mask_path=None):
         if not os.path.exists(video_path):
-            return f"Error: Video file not found: {video_path}", None
+            return f"Error: Video file not found: {video_path}"
             
         task_id = queue_processor.add_task(
             input_path=video_path,
@@ -141,47 +123,29 @@ def create_ui():
             seed=int(seed),
             mask_path=mask_path if mask_path and os.path.exists(mask_path) else None
         )
-        
-        # Return updated queue status
-        return "Added to queue", format_queue_status(queue_processor.get_queue_status())
-
-    def format_queue_status(status):
-        """Format queue status into readable text"""
-        msg = []
-        
-        # Current task
-        if status['current']:
-            task = status['current']
-            msg.append("🔄 Currently Processing:")
-            msg.append(f"  File: {os.path.basename(task['input_path'])}")
-            msg.append(f"  Step: {task['current_step']}")
-            msg.append(f"  Started: {task['start_time']}")
-            msg.append("")
-        
-        # Queued tasks
-        if status['queued']:
-            msg.append("📋 Queue:")
-            for i, task in enumerate(status['queued'], 1):
-                msg.append(f"  {i}. {os.path.basename(task['input_path'])} (Task IDs: {task['task_ids']}, Seed: {task['seed']})")
-            msg.append("")
-        
-        # Completed tasks
-        if status['completed']:
-            msg.append("✅ Recently Completed:")
-            for task in status['completed'][-3:]:  # Show last 3
-                msg.append(f"  • {os.path.basename(task['input_path'])}")
-            msg.append("")
-        
-        # Failed tasks
-        if status['failed']:
-            msg.append("❌ Failed:")
-            for task in status['failed'][-3:]:  # Show last 3
-                msg.append(f"  • {os.path.basename(task['input_path'])}: {task['error']}")
-        
-        return "\n".join(msg) if msg else "Queue is empty"
+        return f"Added to queue. Task ID: {task_id}"
 
     def get_queue_status():
-        return format_queue_status(queue_processor.get_queue_status())
+        status = queue_processor.get_status()
+        
+        # Format status message
+        msg = f"Queue size: {status['queue_size']}\n\n"
+        
+        if status['current_task']:
+            task = status['current_task']
+            msg += f"Currently processing:\n"
+            msg += f"File: {os.path.basename(task['input_path'])}\n"
+            msg += f"Status: {task['status']}\n"
+            msg += f"Started: {task['start_time']}\n\n"
+        
+        msg += "Recent tasks:\n"
+        for task in reversed(status['results'][-5:]):  # Show last 5 tasks
+            msg += f"- {os.path.basename(task['input_path'])}: {task['status']}"
+            if task['error']:
+                msg += f" (Error: {task['error']})"
+            msg += "\n"
+            
+        return msg
 
     with gr.Blocks() as interface:
         gr.Markdown("# Video Processing Queue")
@@ -192,22 +156,16 @@ def create_ui():
                 task_ids = gr.Textbox(label="Task IDs (comma-separated)", value="0")
                 seed = gr.Number(label="Seed", value=77)
                 mask_input = gr.File(label="Mask (optional)")
-                submit_btn = gr.Button("Add to Queue", variant="primary")
+                submit_btn = gr.Button("Add to Queue")
             
             with gr.Column():
-                status_output = gr.Textbox(
-                    label="Queue Status",
-                    interactive=False,
-                    lines=15,
-                    value="Queue is empty"
-                )
+                status_output = gr.Textbox(label="Queue Status", interactive=False)
                 refresh_btn = gr.Button("↻ Refresh Status", variant="secondary")
 
-        # Event handlers
         submit_btn.click(
             fn=add_to_queue,
             inputs=[video_input, task_ids, seed, mask_input],
-            outputs=[gr.Textbox(visible=False), status_output]
+            outputs=status_output
         )
         
         refresh_btn.click(
@@ -220,4 +178,4 @@ def create_ui():
 
 if __name__ == "__main__":
     interface = create_ui()
-    interface.launch(server_name="0.0.0.0", share=False)
+    interface.launch(server_name="0.0.0.0", share=False) 
